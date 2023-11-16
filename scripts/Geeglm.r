@@ -1,0 +1,316 @@
+library(vegan)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(RColorBrewer)
+library(pheatmap)
+library(ggpubr)
+library(tibble)
+
+## inputs ####
+setwd("E:/NeovaginaAssembly 2023/")
+indir  <- paste0(getwd(), "/data/")
+outdir <- paste0(getwd(), "/output/")
+#
+phen.raw <- read.csv(paste0(indir, "MRKH_study_472_456_202310.csv"))
+profile <-
+  merge(
+    read.table(paste0(indir, "prof.count.s__MRKH.txt"), header = T) %>% rownames_to_column("ID"),
+    read.table(paste0(indir, "prof.count.s__v.health.txt"), header = T) %>%
+      rownames_to_column("ID"),
+    by = "ID",
+    all = T
+  ) %>% column_to_rownames("ID")
+profile[is.na(profile)] <- 0
+profile_relab <- decostand(profile, method = "total", 2)
+##
+phen.input <-
+  phen.raw %>% subset(
+    SeqID %in% intersect(colnames(profile_relab), as.vector(phen.raw$SeqID)) &
+      Sites %in% c("V", "GUT") &
+      Cohort == "Study_cohort" & Group != "PFU"
+  )
+prof.input <-
+  profile_relab %>% .[, as.vector(phen.input$SeqID)] %>% .[rowSums(.) != 0, ]  ## 39
+
+## geeglm ####
+library(geepack)
+# Pre-surgery status of individual species (presence/absence or relative abundance) in the dimple or the stool significantly correlated with their relative abundance in the neovagina identified by geeglm
+prof.melt <-
+  merge(
+    phen.input %>% select(SeqID, SubjectID, Timepoints, Sites),
+    data.frame(t(prof.input)) %>% rownames_to_column("SeqID"),
+    by = "SeqID",
+    all.x = T
+  )
+prof.melt <-
+  melt(
+    prof.melt,
+    id.vars = c("SeqID", "SubjectID", "Timepoints", "Sites"),
+    variable.name = "taxa",
+    value.name = "rel_ab"
+  )
+#
+prof.m_Pre  <- prof.melt %>% subset(Sites == "V" &
+                                      Timepoints == "Pre")
+prof.m_neo  <-
+  prof.melt %>% subset(Sites == "V" & !(Timepoints %in% c("Pre")))
+
+#prof.m_Pre  <- prof.melt%>%subset(Sites=="GUT" & Timepoints=="Pre")
+#prof.m_neo  <- prof.melt%>%subset(Sites=="V" & !(Timepoints%in%c("Pre")))
+##
+prof.m <-
+  merge(
+    prof.m_neo,
+    prof.m_Pre %>% select(-SeqID, -Timepoints),
+    by = c("SubjectID", "taxa"),
+    suffixes = c("", ".Pre"),
+    all = T
+  )
+prof.m[is.na(prof.m)] <- 0
+prof.m$rel_ab.neovagina <- prof.m$rel_ab
+prof.m$SubjectID <- as.factor(prof.m$SubjectID)
+prof.m.mean <-
+  prof.m %>% group_by(taxa) %>% summarise_each(funs(mean), rel_ab.Pre, rel_ab.neovagina)
+##
+occurrence.delta <-
+  aggregate(prof.m %>% select(rel_ab.neovagina), by = list(prof.m$taxa), function(x)
+    length(x[x > 0]) / length(x))
+occurrence.pre   <-
+  aggregate(prof.m_Pre %>% select(rel_ab), by = list(prof.m_Pre$taxa), function(x)
+    length(x[x > 0]) / length(x))
+##
+taxa.glm <-
+  intersect(occurrence.delta$Group.1[occurrence.delta$rel_ab.neovagina >
+                                       0.1],
+            occurrence.pre$Group.1[occurrence.pre$rel_ab > 0.1])
+# rel_ab.neovagina
+# rel_ab.Pre
+library(geepack)
+res.test <- c()
+pseu.min.m <-
+  c(prof.m$rel_ab.Pre, prof.m$rel_ab.neovagina) %>% .[. != 0] %>% min(.) %>%
+  log10(.) %>% floor(.)
+pseu.min <- 10 ^ pseu.min.m
+for (i in 1:length(taxa.glm)) {
+  data.test <- prof.m %>% subset(taxa == taxa.glm[i]) %>%
+    mutate(rel_ab.neovagina = scale(log10(rel_ab.neovagina + pseu.min))) %>%
+    mutate(rel_ab.Pre = ifelse(rel_ab.Pre > 0, "1", "0") %>% as.factor())#%>%
+  #mutate(rel_ab.Pre=scale(log10(rel_ab.Pre+pseu.min)))
+  #
+  data.test <- data.test[order(data.test[, 'SubjectID']), ]
+  formula <-
+    paste(c("rel_ab.neovagina ~ ", "rel_ab.Pre"), collapse = "")
+  m.exx <-
+    geeglm(
+      as.formula(formula),
+      data = data.test,
+      id = SubjectID,
+      waves = Timepoints,
+      corstr = "exchangeable"
+    )
+  res.test = rbind(res.test,
+                   data.frame(
+                     taxa = taxa.glm[i],
+                     groups = rownames(coef(summary(m.exx)))[2],
+                     coef(summary(m.exx))[2, c(1, 4)]
+                   ))
+}
+res.test$q <- res.test[, 4] %>% p.adjust(., method = "fdr")
+## add mean
+res.test <- merge(res.test, prof.m.mean, all.x = T) %>% arrange(q)
+prefix <- "Pre_0_1_0.1" # "Pre_Abun_0.1"  "PreAbun_gutPre_0.1"
+res.test %>% subset(q < 0.1)
+#write.table(res.test,paste0(outdir,"res.geeglm.",prefix,".txt"),quote = F,sep = "\t",row.names = F)
+
+### combine  ####
+file.list.geeglm <-
+  list.files(path = outdir, pattern = "txt") %>% .[grep("res.geeglm", .)]
+file.list.geeglm <-
+  file.list.geeglm[grep("0.1.txt", file.list.geeglm)]
+file.list.geeglm <- file.list.geeglm[1:3]
+
+gg.q <- c()
+for (i in 1:length(file.list.geeglm)) {
+  temp <-
+    read.table(paste0(outdir, file.list.geeglm[i]), header = T) %>% select(taxa, q) %>%
+    mutate(file = file.list.geeglm[i])
+  gg.q <- rbind(gg.q, temp)
+}
+gg.e <- c()
+for (i in 1:length(file.list.geeglm)) {
+  temp <-
+    read.table(paste0(outdir, file.list.geeglm[i]), header = T) %>% select(taxa, Estimate) %>%
+    mutate(file = file.list.geeglm[i])
+  gg.e <- rbind(gg.e, temp)
+}
+gg.q$file <-
+  gg.q$file %>% gsub("res.geeglm.", "", .) %>% gsub("_0.1.*", "", .)
+gg.e$file <-
+  gg.e$file %>% gsub("res.geeglm.", "", .) %>% gsub("_0.1.*", "", .)
+## 任一小于0.1
+taxa.q.min <-
+  gg.q %>% group_by(taxa) %>% summarise(q.min = min(q)) %>% subset(q.min < 0.1)
+taxa.q.min$taxa
+
+#
+rho.filt <-
+  dcast(gg.e, taxa ~ file, value.var = "Estimate") %>% subset(taxa %in% taxa.q.min$taxa)
+rownames(rho.filt) <- NULL
+rho.filt <- rho.filt %>% column_to_rownames(., "taxa")
+rho.filt[is.na(rho.filt)] <- 0
+#
+p.adj.sign <-
+  dcast(gg.q, taxa ~ file, value.var = "q") %>% subset(taxa %in% taxa.q.min$taxa)
+rownames(p.adj.sign) <- NULL
+p.adj.sign <- p.adj.sign %>% column_to_rownames(., "taxa")
+p.adj.sign[is.na(p.adj.sign)] <- 1
+##
+p.adj.sign[p.adj.sign >= 0.1] <- NA
+p.adj.sign[p.adj.sign < 0.1] <- "*"
+p.adj.sign[is.na(p.adj.sign)] <- " "
+
+### order
+tax.MRKH.order <-
+  rowSums(prof.input[, phen.input$SeqID[phen.input$Sites == "V"]]) %>% .[order(., decreasing = T)] %>%
+  names
+rho.filt <- rho.filt[intersect(tax.MRKH.order, rownames(rho.filt)), ]
+p.adj.sign <-
+  p.adj.sign[intersect(tax.MRKH.order, rownames(p.adj.sign)), ]
+#
+#pdf(paste0(outdir, "res.geeglm.combine.mean0.001.pdf"),width = 10,height = 14)
+pheatmap::pheatmap(
+  rho.filt,
+  display_numbers = p.adj.sign,
+  fontsize_number = 15,
+  fontsize = 12,
+  cellwidth = 25,
+  cellheight = 18,
+  cluster_cols = F,
+  cluster_rows = F,
+  gaps_col = 2,
+  color = colorRampPalette(colors = c("white", "#E64B35FF"))(100)
+)
+#dev.off()
+#write.table(merge(gg.e,gg.q,all = T),paste0(outdir,"res.geeglm.combine.txt"),quote = F,sep = "\t",row.names = F)
+
+
+### Six species of MRKH patients following different patterns for their development  ####
+dat.draw <- profile_relab
+dat.draw$tax <- rownames(dat.draw)
+dat.m  <- melt(dat.draw, id.vars = "tax", variable.name = "SeqID")
+dat.m  <- merge(dat.m, phen.input, by = "SeqID", all.x = T)
+dat.m$tax <- gsub("_", " ", dat.m$tax)
+dat.m$Group <-
+  factor(dat.m$Group, levels = c("Pre", "P14D", "P90D", "P3Y"))
+
+select.tax <- c(
+  "Lactobacillus crispatus",
+  "Ureaplasma parvum",
+  "Atopobium vaginae",
+  "Lactobacillus iners",
+  "Gardnerella vaginalis",
+  "Prevotella timonensis"
+)
+re.select.tax <- c("L. crispatus",
+                   "U. parvum",
+                   "A. vaginae",
+                   "L. iners",
+                   "G. vaginalis",
+                   "P. timonensis")
+cbPa.39 <-
+  c(
+    brewer.pal(8, "Dark2"),
+    brewer.pal(8, "Accent")[c(1:3, 5:8)],
+    brewer.pal(8, "Set2"),
+    brewer.pal(10, "Paired"),
+    brewer.pal(8, "Pastel2")
+  )
+names(cbPa.39) <- unique(phen.input$SubjectID) %>% .[order(.)]
+
+pick.list <- list()
+res.data <- c()
+cutoff.max <- 0  # 0.0001 #
+pseu.min <-
+  0.01 * min(dat.m$value[dat.m$value != 0]) # 0.01*cutoff.max  #
+
+for (i in 1:length(select.tax)) {
+  data <-
+    dat.m %>% subset(tax == select.tax[i]) %>% mutate(reshape = ifelse(value >
+                                                                         cutoff.max, "Presence", "Absence"))
+  data <-
+    merge(
+      data,
+      data %>% subset(Group == "Pre") %>% select(SubjectID, tax, value) %>% rename(value.pre =
+                                                                                     value),
+      all = T
+    )
+  ## pre abs/pre
+  id.abs <-
+    (data %>% subset(Group == "Pre" &
+                       reshape == "Absence"))$SubjectID %>% as.vector()
+  id.pre <-
+    (data %>% subset(Group == "Pre" &
+                       reshape == "Presence"))$SubjectID %>% as.vector()
+  data$sub <-
+    ifelse(data$SubjectID %in% id.abs, "Absence_sub", "Presence_sub") %>% factor(., levels =
+                                                                                   c("Presence_sub", "Absence_sub"))
+  ##
+  data$value[data$value <= cutoff.max] <- pseu.min
+  data$value.pre[data$value.pre <= cutoff.max] <- pseu.min
+  data$fc2 <- log2(data$value / data$value.pre)
+  label.x <- merge(
+    data %>% group_by(Group, sub) %>% summarise(n = n()),
+    data %>% subset(value > pseu.min) %>% group_by(Group, sub) %>%
+      summarise(n_4 = n()),
+    by = c("Group", "sub"),
+    all = T
+  ) %>% mutate(n_x = paste0("(", n_4, "/", n, ")")) %>% arrange(sub, Group)
+  label.x$n_x <- gsub("NA", "0", label.x$n_x)
+  data <- merge(data, label.x, by = c("Group", "sub"), all = T)
+  
+  p <- ggplot(data, aes(Group, value, color = SubjectID)) +
+    geom_point(size = 1) +
+    geom_line(aes(group = SubjectID)) +
+    scale_color_manual(values = cbPa.39, guide = guide_legend(ncol = 2)) +
+    facet_wrap( ~ sub, scales = "fixed") +
+    labs(
+      x = "",
+      y = paste0("Relative Abundance"),
+      title = re.select.tax[i],
+      caption = paste(label.x$n_x, collapse = " ")
+    ) +
+    theme_light() + theme(
+      text = element_text(size = 7),
+      axis.text = element_text(size = 7),
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "italic"),
+      strip.background = element_blank(),
+      strip.text = element_text(color = "black", size = 6)
+    )
+  pick.list[[i]] <- p
+  res.data <-
+    rbind(res.data,
+          data %>% select(tax, sub, Group, value, reshape, SubjectID, n:n_x))
+}
+
+ggarrange(
+  pick.list[[1]],
+  pick.list[[2]],
+  pick.list[[3]],
+  pick.list[[4]],
+  pick.list[[5]],
+  pick.list[[6]],
+  ncol = 3,
+  nrow = 2,
+  common.legend = T,
+  legend = "right",
+  align = "hv",
+  labels = letters,
+  font.label = list(
+    color = "black",
+    size = 7,
+    face = "bold"
+  )
+)
+#ggsave(paste0(outdir, "sFig12.",cutoff.max,".pdf"), width = 12,height = 5)

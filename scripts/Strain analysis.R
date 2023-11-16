@@ -1,0 +1,576 @@
+library(vegan)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(RColorBrewer)
+library(pheatmap)
+library(ggpubr)
+library(tibble)
+library(stringr)
+
+## Inputs ####
+setwd("E:/NeovaginaAssembly 2023/")
+indir  <- paste0(getwd(), "/data/")
+outdir <- paste0(getwd(), "/output/")
+#
+phen.raw <- read.csv(paste0(indir, "MRKH_study_472_456_202310.csv"))
+profile <-
+  read.table(paste0(indir, "prof.count.s__MRKH.txt"), header = T)
+profile_relab <- decostand(profile, method = "total", 2)
+##
+phen.input <- phen.raw %>% subset(Cohort == "Study_cohort")
+prof.s.MRKH <-
+  profile_relab %>% .[, intersect(colnames(profile_relab),
+                                  (subset(phen.input, Sites == "V" &
+                                            Group != "PFU"))$SeqID)] %>%
+  .[rowSums(.) != 0, ]
+tax.top.MRKH <-
+  rowSums(prof.s.MRKH) %>% .[order(., decreasing = T)] %>% names
+# ORDER
+phen.input$Group <-
+  factor(phen.input$Group, levels = c("Pre", "P14D", "P90D", "PFU", "P3Y"))
+
+## dist.sum.raw ####
+dist.raw <-
+  read.delim(paste0(indir, "/dist_tree_sum.0622.txt"), header = F)
+#
+dist.sum.raw  <- dist.raw %>%
+  mutate(
+    V2 = gsub("-", ".", V2),
+    V3 = gsub("-", ".", V3),
+    V1 = gsub("s__", "", V1)
+  ) %>%
+  subset(V1 != V2)
+## add sites
+colnames(dist.sum.raw) <- c("tax", "source", "variable", "value")
+df.median <-
+  dist.sum.raw %>% group_by(tax) %>% summarise(median = median(value))
+
+dist.sum.raw <- dist.sum.raw %>% ##","g1","g2","s1","s2"
+  mutate(
+    g1 = phen.input$Timepoints[match(source, phen.input$SeqID)],
+    g2 = phen.input$Timepoints[match(variable, phen.input$SeqID)],
+    s1 = phen.input$SubjectID[match(source, phen.input$SeqID)],
+    s2 = phen.input$SubjectID[match(variable, phen.input$SeqID)],
+    site1 = phen.input$Sites[match(source, phen.input$SeqID)],
+    site2 = phen.input$Sites[match(variable, phen.input$SeqID)],
+    median = df.median$median[match(tax, df.median$tax)]
+  ) %>%
+  mutate(
+    rawvalue = value,
+    value = rawvalue / median,
+    site = paste(site1, site2)
+  )
+
+
+## intra- & inter-subject, different groups
+dist.sum.raw <- dist.sum.raw %>%
+  mutate(
+    groups = paste0(g1, " to ", g2),
+    ss = ifelse(s1 == s2, "intra-subject", "inter-subject")
+  ) %>%
+  mutate(ss = factor(ss, levels = c("intra-subject", "inter-subject")))
+
+## recode groups
+unique(dist.sum.raw$groups)
+
+dist.sum.raw$groups <-
+  gsub("P14D to Pre", "Pre to P14D", dist.sum.raw$groups) %>%
+  gsub("P90D to Pre", "Pre to P90D", .) %>%
+  gsub("P90D to P14D", "P14D to P90D", .) %>%
+  gsub("PFU to P90D", "P90D to PFU", .)
+dist.sum.raw$groups <-
+  factor(
+    dist.sum.raw$groups,
+    levels = c(
+      "Pre to P14D",
+      "Pre to P90D",
+      "Pre to PFU",
+      "Pre to P3Y",
+      "P14D to P90D",
+      "P14D to PFU",
+      "P14D to P3Y",
+      "P90D to PFU",
+      "P90D to P3Y",
+      "PFU to P3Y",
+      "Pre to Pre",
+      "P14D to P14D",
+      "P90D to P90D",
+      "PFU to PFU",
+      "P3Y to P3Y"
+    )
+  )
+## recode site
+unique(dist.sum.raw$site)
+dist.sum.raw$site <- gsub("GUT", "G", dist.sum.raw$site)
+unique(dist.sum.raw$site)
+dist.sum.raw$site <- dist.sum.raw$site %>%
+  gsub("V G", "G V", .) %>%
+  gsub("V T", "T V", .) %>%
+  gsub("V SK", "SK V", .) %>%
+  gsub("V Saline", "Saline V", .) %>%
+  gsub("G T", "T G", .) %>%
+  gsub("G SK", "SK G", .) %>%
+  gsub("G Saline", "Saline G", .) %>%
+  gsub("T SK", "SK T", .) %>%
+  gsub("T Saline", "Saline T", .) %>%
+  gsub("SK Saline", "Saline SK", .)
+
+## Transmissibility across sites  ##############
+dist.sum.raw.2 <- dist.sum.raw %>%
+  mutate(Site.Tim = paste0(site1, g1),
+         Site.Tim.2 = paste0(site2, g2)) %>%
+  subset((
+    site %in% c("G V", "SK V", "T V") &
+      Site.Tim != "VPre" & Site.Tim.2 != "VPre"
+  ) |  ## G, SK, T with neovagina
+    (
+      site == "V V" &
+        groups %in% c("Pre to P14D", "Pre to P90D", "Pre to PFU", "Pre to P3Y")
+    )) ## dimple with neovagina
+
+dist.sum.raw.2 <- dist.sum.raw.2 %>% rename(
+  .,
+  SubjectID = s1,
+  SubjectID.2 = s2,
+  Timepoints = g1,
+  Timepoints.2 = g2,
+  Sites = site1,
+  Sites.2 = site2
+)
+
+# same subject
+dist.sum.raw.samsub <- dist.sum.raw.2 %>% subset(ss == "intra-subject")  
+
+#
+sharing_intra_list_merge <- dist.sum.raw.samsub %>%
+  group_by(tax, site, SubjectID) %>% summarise(min = min(value)) %>%
+  mutate(shared = ifelse(min < 0.1, 1, 0)) %>%
+  subset(tax != "Human_betaherpesvirus_6B")
+#
+sharing_tax <- sharing_intra_list_merge %>% group_by(site, tax) %>%
+  summarise(sn_shared = sum(na.omit(shared)), sn = length(na.omit(min))) %>%
+  mutate(rate = sn_shared / sn)
+sharing_tax$site <-
+  factor(sharing_tax$site, levels = c("V V", "G V", "SK V", "T V"))
+sharing_tax$rate_split <-
+  sharing_tax$rate %>% cut(., breaks = seq(-0, 1, 0.1))
+# tax order
+setdiff(sharing_tax$tax, tax.top.MRKH)
+tax.top.MRKH <-
+  c(tax.top.MRKH, setdiff(sharing_tax$tax, tax.top.MRKH))
+sharing_tax$tax <-
+  factor(sharing_tax$tax, levels = rev(tax.top.MRKH))
+# GV VV(dimple-neoV) sharing
+tax.site.rate <- dcast(sharing_tax, tax ~ site, value.var = "rate")
+tax.site.rate[is.na(tax.site.rate)] <- 0
+tax.site.rate <- tax.site.rate %>%
+  mutate(GV_sharing = ifelse(
+    `V V` > 0 & `G V` == 0,
+    "dimple",
+    ifelse(`V V` > 0 & `G V` > 0, "G-V",
+           ifelse(`V V` == 0 &
+                    `G V` > 0, "G", "NONE"))
+  ))
+tax.site.rate$GV_sharing <-
+  factor(tax.site.rate$GV_sharing,
+         levels = c("dimple", "G-V", "G", "NONE"))
+tax.site.rate$tax <-
+  factor(tax.site.rate$tax, levels = c(tax.top.MRKH))
+# sn_shared
+tax.site.sn_shared <-
+  dcast(sharing_tax, tax ~ site, value.var = "sn_shared")
+tax.site.sn_shared[is.na(tax.site.sn_shared)] <- 0
+colnames(tax.site.sn_shared) <-
+  paste("sn_shared", colnames(tax.site.sn_shared), sep = "_") %>% gsub(" ", "", .)
+colnames(tax.site.sn_shared)[1] <- "tax"
+tax.site.rate <- merge(tax.site.rate, tax.site.sn_shared, by = "tax")
+tax.site.rate$sn_shared_GVplusVV <-
+  tax.site.rate$sn_shared_GV + tax.site.rate$sn_shared_VV
+#order
+tax.site.rate <-
+  tax.site.rate %>% arrange(GV_sharing, -sn_shared_VV, -sn_shared_GV, `V V`, `G V`, tax)
+#
+sharing_tax$GV_sharing <-
+  tax.site.rate$GV_sharing[match(sharing_tax$tax, tax.site.rate$tax)]
+sharing_tax$tax <-
+  factor(sharing_tax$tax, levels = rev(unique(tax.site.rate$tax)))
+sharing_tax$site <- as.numeric(sharing_tax$site)
+sharing_tax$labels <-
+  paste(sharing_tax$sn_shared, sharing_tax$sn, sep = "/")
+ggplot(sharing_tax, aes(x = site, y = tax)) +
+  geom_vline(
+    xintercept = c(0.5, 1.5, 2.5, 3.5, 4.5),
+    color = "grey50",
+    linetype = "longdash"
+  ) +
+  geom_point(aes(size = sn_shared, color = rate), alpha = 0.8) +
+  geom_text(
+    aes(label = labels),
+    hjust = -0.5,
+    size = 3,
+    color = "grey30"
+  ) +
+  scale_color_gradient(low = "#56B1F7", high = "red") +
+  scale_size_area(max_size = 6) +
+  scale_x_discrete(labels = c("Dimple-NeoV", "Gut-NeoV", "Skin-NeoV", "Tongue-NeoV")) +
+  labs(x = "",
+       y = "",
+       color = "Rate of same strain",
+       size = "Num of same strain") +
+  theme_classic() +
+  theme(panel.grid.major.y = element_line(linetype = "longdash", color =
+                                            "grey95")) +
+  theme(
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12,
+                               color = brewer.pal(4, "Dark2")[as.numeric(sharing_tax$GV_sharing[match(levels(sharing_tax$tax), sharing_tax$tax)])])
+  )
+#ggsave(paste0(outdir, "transmissibility.pdf"),width = 9,height = 12)
+#write.table(sharing_tax ,  paste0(outdir, "transmissibility.txt"),  quote = F,  sep = "\t",  row.names = F)
+
+
+### longterm-neovagina ##########
+dist.sum.raw.2 <- dist.sum.raw %>%
+  mutate(Site.Tim = paste0(site1, g1),
+         Site.Tim.2 = paste0(site2, g2)) %>%
+  subset((
+    site %in% c("G V", "SK V", "T V") &
+      Site.Tim != "VPre" & Site.Tim.2 != "VPre"
+  ) |  # G,SK,T with neoV
+    (site == "V V")) ## Dimple with neoV
+dist.sum.raw.2 <- dist.sum.raw.2 %>% rename(
+  .,
+  SubjectID = s1,
+  SubjectID.2 = s2,
+  Timepoints = g1,
+  Timepoints.2 = g2,
+  Sites = site1,
+  Sites.2 = site2
+)
+dist.sum.raw.samsub <- dist.sum.raw.2 %>% subset(ss == "intra-subject")
+dist.sum.raw.samsub$groups.2nd <-
+  dist.sum.raw.samsub$groups %>% str_split_fixed(., " ", 3) %>% .[, 3]
+##
+sharing_strain_3Y <-
+  dist.sum.raw.samsub %>% subset(site == "V V" &
+                                   Timepoints != "Pre" & groups.2nd == "P3Y")
+sharing_strain_3Y$Transmission <-
+  ifelse(sharing_strain_3Y$value > 0.1, "No(variation)", "Yes(same)")
+setdiff(sharing_strain_3Y$tax, tax.top.MRKH)
+tax.top.MRKH <-
+  c(tax.top.MRKH, setdiff(sharing_strain_3Y$tax, tax.top.MRKH))
+sharing_strain_3Y$tax <-
+  factor(sharing_strain_3Y$tax, levels = tax.top.MRKH)
+
+sharing_strain_3Y$Timepoints.num <-
+  sharing_strain_3Y$Timepoints %>% as.factor() %>% as.numeric()
+sharing_strain_3Y <-
+  sharing_strain_3Y %>% subset(tax != "Human_betaherpesvirus_6B")
+
+ggplot(sharing_strain_3Y, aes(x = groups, y = SubjectID)) +
+  geom_line(aes(group = SubjectID)) +
+  geom_point(aes(shape = Transmission)) +
+  scale_shape_manual(values = c(1, 16)) +
+  theme_light() + theme(axis.text.x = element_text(angle = 90)) + facet_wrap(~
+                                                                               tax, scales = "free_y", ncol = 4)
+#ggsave(paste0(outdir, "/", "longterm-neovagina.pdf"),       width = 12,       height = 12)
+
+
+# same at all timepoints
+P3Y_all1Y <-
+  dcast(sharing_strain_3Y, tax + SubjectID ~ Timepoints.num, value.var = "Transmission")
+P3Y_all1Y[is.na(P3Y_all1Y)] <- 0
+P3Y_all1Y$Transmission <-
+  apply(P3Y_all1Y[, c(3:5)], 1, function(x)
+    all(x != "No(variation)"))
+##
+sharing_strain_3Y_last <- P3Y_all1Y
+sharing_strain_3Y_last$Transmission.num <-
+  as.factor(sharing_strain_3Y_last$Transmission) %>% as.numeric()
+#
+data.draw <-
+  dcast(sharing_strain_3Y_last, tax ~ SubjectID, value.var = "Transmission.num")
+data.draw[is.na(data.draw)] <- 0
+#pdf(paste0(outdir, "longterm-neovagina.all1Y.heat.pdf"),width = 6,height = 8)
+pheatmap(data.draw %>% column_to_rownames("tax"),
+         color = colorRampPalette(colors = c("white", "#045A8D", "#E64B35FF"))(100))
+#dev.off()
+
+
+
+
+## stranphlan points (all)#######
+dist.sum.raw.2 <- dist.sum.raw %>%
+  mutate(Site.Tim = paste0(site1, g1),
+         Site.Tim.2 = paste0(site2, g2)) %>%
+  subset((site %in% c("G V", "SK V", "T V")) |
+           ### multiple sites, time
+           (site == "V V")) ##
+dist.sum.raw.2 <- dist.sum.raw.2 %>% rename(
+  .,
+  SubjectID = s1,
+  SubjectID.2 = s2,
+  Timepoints = g1,
+  Timepoints.2 = g2,
+  Sites = site1,
+  Sites.2 = site2
+)
+# same subject
+dist.sum.raw.samsub <- dist.sum.raw.2 %>% subset(ss == "intra-subject")
+dist.sum.raw.samsub$groups.2nd <-
+  dist.sum.raw.samsub$groups %>% str_split_fixed(., " ", 3) %>% .[, 3]
+dist.sum.raw.samsub$Site.Tim.12 <-
+  ifelse(
+    str_detect(dist.sum.raw.samsub$Site.Tim.2, "V"),
+    paste0(
+      dist.sum.raw.samsub$Site.Tim,
+      "_",
+      dist.sum.raw.samsub$Site.Tim.2
+    ),
+    paste0(
+      dist.sum.raw.samsub$Site.Tim.2,
+      "_",
+      dist.sum.raw.samsub$Site.Tim
+    )
+  )
+Site.Tim.12.num <-
+  dist.sum.raw.samsub$Site.Tim.12 %>% gsub("V|GUT|T|SK", "", .) %>%
+  gsub("Pre", "1", .) %>% gsub("P14D", "2", .) %>% gsub("P90D", "3", .) %>%
+  gsub("PFU", "4", .) %>% gsub("P3Y", "5", .) %>% str_split_fixed(., "_", 2) %>%
+  data.frame()
+dist.sum.raw.samsub$Site.Tim.12.Vdiff <-
+  as.numeric(Site.Tim.12.num$X2) - as.numeric(Site.Tim.12.num$X1)
+dist.sum.raw.samsub$Site.Tim.12 <-
+  ifelse(
+    dist.sum.raw.samsub$Site.Tim.12.Vdiff < 0 &
+      dist.sum.raw.samsub$site == "V V",
+    paste0(
+      dist.sum.raw.samsub$Site.Tim.2,
+      "_",
+      dist.sum.raw.samsub$Site.Tim
+    ),
+    as.vector(dist.sum.raw.samsub$Site.Tim.12)
+  )
+
+# x-axis
+dist.sum.raw.samsub$Site.Tim.12.1 <-
+  str_split_fixed(dist.sum.raw.samsub$Site.Tim.12, "_", 2)[, 1] %>% gsub("GUT|T|SK|V", "", .)
+dist.sum.raw.samsub$Site.Tim.12.2 <-
+  str_split_fixed(dist.sum.raw.samsub$Site.Tim.12, "_", 2)[, 2]
+# y-axis
+dist.sum.raw.samsub$reshape.Site.Tim.12 <-
+  ifelse(
+    dist.sum.raw.samsub$site == "V V",
+    "V V",
+    ifelse(
+      dist.sum.raw.samsub$Site.Tim.12.Vdiff == 0,
+      paste0(dist.sum.raw.samsub$site, "_", "eql"),
+      ifelse(
+        dist.sum.raw.samsub$Site.Tim.12.Vdiff < 0,
+        paste0(dist.sum.raw.samsub$site, "_", "rev"),
+        as.vector(dist.sum.raw.samsub$site)
+      )
+    )
+  )
+dist.sum.raw.samsub$reshape.Site.Tim.12 <-
+  dist.sum.raw.samsub$reshape.Site.Tim.12 %>% gsub("G V_rev", "V G", .) %>%
+  gsub("T V_rev", "V T", .)
+##
+dist.gv.picked <-
+  dist.sum.raw.samsub %>% dplyr::select(
+    tax:value,
+    SubjectID,
+    site:ss,
+    Site.Tim.12,
+    Site.Tim.12.1,
+    Site.Tim.12.2,
+    reshape.Site.Tim.12
+  )
+dist.gv.picked <-
+  dist.gv.picked %>% mutate(
+    Transmission = ifelse(value > 0.1, "No(variation)", "Yes(same)"),
+    y = paste(SubjectID, reshape.Site.Tim.12)
+  )
+dist.gv.picked$Site.Tim.12.1 <-
+  recode_factor(
+    dist.gv.picked$Site.Tim.12.1,
+    "Pre" = "Pre",
+    "P14D" = "P14D",
+    "P90D" = "P90D",
+    "PFU" = "PFU"
+  )
+dist.gv.picked$Site.Tim.12.2 <-
+  recode_factor(
+    dist.gv.picked$Site.Tim.12.2,
+    "VPre" = "VPre",
+    "VP14D" = "VP14D",
+    "VP90D" = "VP90D",
+    "VPFU" = "VPFU",
+    "VP3Y" = "VP3Y"
+  )
+
+setdiff(dist.gv.picked$tax, tax.top.MRKH)
+tax.top.MRKH <-
+  c(tax.top.MRKH, setdiff(dist.gv.picked$tax, tax.top.MRKH))
+dist.gv.picked$tax <-
+  factor(dist.gv.picked$tax, levels = tax.top.MRKH)
+
+#write.csv(dist.gv.picked,          paste0(outdir, "/strain.POINTS.csv"),          quote = F)
+
+### V14D trans stat#####
+dist.gv.picked.VP14D <-
+  dist.gv.picked %>% subset(Site.Tim.12 %in% c("VPre_VP14D", "GUTPre_VP14D"))
+# stat VP14D
+dist.picked.VP14D <-
+  dist.gv.picked.VP14D %>% group_by(tax, Site.Tim.12, Transmission) %>% summarise(Num =
+                                                                                    n())
+dist.picked.VP14D$Site.Tim.12 <-
+  recode_factor(
+    dist.picked.VP14D$Site.Tim.12,
+    "VPre_VP14D" = "VPre_V14D",
+    "GUTPre_VP14D" = "GutPre_V14D")
+levels(dist.picked.VP14D$Site.Tim.12)
+tax.order <-
+  aggregate(dist.picked.VP14D$Num, list(dist.picked.VP14D$tax), sum) %>% arrange(-x) %>%
+  .[, "Group.1"] %>% as.vector()
+dist.picked.VP14D$tax <-
+  factor(dist.picked.VP14D$tax, levels = rev(tax.order))
+ggplot(dist.picked.VP14D,
+       aes(x = tax, y = Num)) + coord_flip() +
+  geom_bar(stat = "identity", aes(fill = Transmission)) +
+  scale_fill_manual(values = brewer.pal(6, "Paired")) +
+  facet_wrap(~ Site.Tim.12, nrow = 1) + theme_pubclean()
+#ggsave(  paste0(outdir, "/strain.trans.VP14D.pdf"),  width = 10,  height = 10,  limitsize = FALSE)
+
+
+### select mentioned  ######
+tax.231027 <- c(
+  "Lactobacillus_crispatus",
+  "Lactobacillus_iners",
+  "Ureaplasma_parvum",
+  "Prevotella_bivia",
+  "Streptococcus_anginosus_group",
+  "Prevotella_timonensis",
+  "Campylobacter_ureolyticus",
+  "Prevotella_disiens",
+  "Gardnerella_vaginalis",
+  "Finegoldia_magna",
+  "Ureaplasma_urealyticum",
+  "Bacteroides_vulgatus",
+  "Bacteroides_thetaiotaomicron",
+  "Bifidobacterium_longum",
+  "Ruminococcus_gnavus",
+  "Akkermansia_muciniphila"
+)
+
+dist.gv.picked.cc <- dist.gv.picked %>%
+  subset(tax %in% tax.231027)
+pal.site <- rev(c("darkgreen", "#3182bd", "pink", "#fd8d3c"))
+ggplot(dist.gv.picked.cc,
+       aes(x = Site.Tim.12.2, y = y, color = Site.Tim.12.1)) +
+  geom_point(
+    aes(shape = Transmission),
+    size = 3,
+    stroke = 1.5,
+    position = position_jitterdodge(jitter.width = 0.1)
+  ) +
+  facet_wrap(~ tax, scales = "free_y", ncol = 8) +
+  geom_vline(xintercept = seq(1.5, 4.5, 1), color = "grey70") +
+  scale_color_manual(values = pal.site, guide = guide_legend(reverse = TRUE)) +
+  scale_shape_manual(values = c(1, 16)) + labs(x = "", y = "") + #0,15
+  theme_linedraw() + theme(
+    panel.grid.major.y = element_line(color = "grey90", linetype = "dashed"),
+    panel.grid.major.x = element_line(color = "grey90", linetype = "dashed"),
+    strip.background = element_blank(),
+    strip.text = element_text(color = "black", face = "italic")
+  )
+#ggsave(paste0(outdir, "/strain.POINTS.231027.pdf"), width = 30,height = 10, limitsize = FALSE)
+
+
+
+# matched trees ####
+library(ggtree)
+indir_tree <- paste0(indir, "/tree.2023.06.22/")
+#
+phen.meta <-
+  read.csv(paste0(indir, "MRKH_study_472_456_202310.csv")) %>% subset(Cohort == "Study_cohort")
+phen.meta$Sub_site <-
+  paste(phen.meta$Sites %>% gsub("GUT", "G", .), phen.meta$SubjectID)
+phen.meta$SubjectID <-
+  factor(phen.meta$SubjectID, levels = unique(phen.meta$SubjectID) %>% .[order(.)])
+phen.meta$SeqID <-
+  paste(gsub("..$", "", phen.meta$SeqID),
+        str_sub(phen.meta$SeqID, -1, -1),
+        sep = "-")
+rownames(phen.meta) <- phen.meta$SeqID
+phen.meta$label <- phen.meta$SeqID
+
+## order
+picked.markers <-
+  c(
+    "Lactobacillus_crispatus",
+    "Lactobacillus_iners",
+    "Prevotella_timonensis",
+    "Gardnerella_vaginalis",
+    "Ureaplasma_urealyticum"
+  )
+
+## set color
+cbPa.39 <-
+  c(
+    brewer.pal(8, "Dark2"),
+    brewer.pal(8, "Accent")[c(1:3, 5:8)],
+    brewer.pal(8, "Set2"),
+    brewer.pal(10, "Paired"),
+    brewer.pal(8, "Pastel2")
+  )[1:39]
+names(cbPa.39) <- unique(phen.meta$SubjectID) %>% .[order(.)]
+
+## draw
+pick.list <- list()
+for (sp.names in picked.markers) {
+  ##
+  tree.file <-
+    paste0(indir_tree,
+           "RAxML_bestTree.s__",
+           sp.names,
+           ".StrainPhlAn3.tre")
+  outfiles  <- paste0(outdir, sp.names, "_tree.pdf")
+  e.sir.tre <- read.tree(tree.file)
+  e.sir.gg <-
+    ggtree(e.sir.tre, layout = "rectangular")
+  e.sir.meta <- phen.meta
+  e.sir.gg$data <-
+    merge(e.sir.gg$data, phen.meta, by = "label", all.x =
+            T)
+  e.sir.gg$data$Timepoints[is.na(e.sir.gg$data$Timepoints)] <-
+    "OTHERS"
+  e.sir.gg$data$Timepoints <-
+    factor(e.sir.gg$data$Timepoints,
+           levels = c("Pre", "P14D", "P90D", "PFU", "P3Y", "OTHERS"))
+  ###
+  p <- e.sir.gg +
+    geom_tippoint(size = 3.5,
+                  stroke = 1.2,
+                  aes(color = SubjectID, shape = Timepoints)) +
+    aes(branch.length = 'length', ) +
+    geom_tiplab(
+      aes(label = Sub_site, col = SubjectID),
+      hjust = -0.2,
+      size = 4,
+      fontface = 2 ,
+      align = F
+    ) +
+    scale_shape_manual(
+      values = c(15, 12, 17, 10, 16, 4),
+      breaks = c("Pre", "P14D", "P90D", "PFU", "P3Y", "OTHERS")
+    ) +
+    scale_color_manual(values = cbPa.39) +
+    xlim(NA, max(e.sir.gg$data$x) * 1.2) +
+    theme_tree2() + theme(legend.position = "right") + labs(title = sp.names)
+  p
+  #ggsave(paste0(outdir, "/tree.", sp.names, ".pdf"),width = 7,height = length(na.omit(e.sir.gg$data$label)) * 0.2 )
+  pick.list[[match(sp.names, picked.markers)]] <- p
+}
+
